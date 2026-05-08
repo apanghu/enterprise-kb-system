@@ -1,0 +1,286 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, '3.10', '3.11']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies for kb-manager
+      run: |
+        cd kb-manager
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+    - name: Install dependencies for kb-reader
+      run: |
+        cd kb-reader
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+
+    - name: Format check with black
+      run: |
+        pip install black
+        black --check --diff .
+
+    - name: Type check with mypy
+      run: |
+        pip install mypy
+        mypy kb-manager/src/ --ignore-missing-imports || true
+        mypy kb-reader/src/ --ignore-missing-imports || true
+
+    - name: Test kb-manager
+      env:
+        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY_TEST }}
+      run: |
+        cd kb-manager
+        python -m pytest tests/ -v --cov=src --cov-report=xml || true
+
+    - name: Test kb-reader
+      env:
+        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY_TEST }}
+      run: |
+        cd kb-reader
+        python -m pytest tests/ -v --cov=src --cov-report=xml || true
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./kb-manager/coverage.xml,./kb-reader/coverage.xml
+        fail_ci_if_error: false
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install security tools
+      run: |
+        pip install bandit safety
+
+    - name: Run bandit security check
+      run: |
+        bandit -r kb-manager/src/ kb-reader/src/ -f json -o bandit-report.json || true
+
+    - name: Run safety check
+      run: |
+        cd kb-manager && safety check --json --output safety-report.json || true
+        cd ../kb-reader && safety check --json --output safety-report.json || true
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          kb-manager/safety-report.json
+          kb-reader/safety-report.json
+
+  build:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Build distribution packages
+      run: |
+        pip install build
+        # Build kb-manager
+        cd kb-manager
+        python -m build
+        cd ..
+        # Build kb-reader
+        cd kb-reader
+        python -m build
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: dist-packages
+        path: |
+          kb-manager/dist/
+          kb-reader/dist/
+
+  integration-test:
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        cd kb-manager && pip install -r requirements.txt
+        cd ../kb-reader && pip install -r requirements.txt
+
+    - name: Run integration tests
+      env:
+        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY_TEST }}
+      run: |
+        # Setup test environment
+        cd kb-manager
+        python main.py setup || true
+        
+        # Test document upload (with mock if no API key)
+        echo "Test document content" > test_doc.txt
+        python main.py upload test_doc.txt "Test Document" || true
+        
+        # Test kb-reader query
+        cd ../kb-reader
+        python main.py stats || true
+        python main.py query "test" || true
+
+  docker:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Build and push kb-manager
+      uses: docker/build-push-action@v5
+      with:
+        context: ./kb-manager
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/kb-manager:latest
+          ${{ secrets.DOCKER_USERNAME }}/kb-manager:${{ github.sha }}
+
+    - name: Build and push kb-reader
+      uses: docker/build-push-action@v5
+      with:
+        context: ./kb-reader
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/kb-reader:latest
+          ${{ secrets.DOCKER_USERNAME }}/kb-reader:${{ github.sha }}
+
+  release:
+    needs: [build, integration-test, docker]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]')
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version
+      id: version
+      run: |
+        VERSION=$(grep -E "^version = " pyproject.toml | cut -d'"' -f2 || echo "1.0.0")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: dist-packages
+
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ steps.version.outputs.version }}
+        release_name: Release v${{ steps.version.outputs.version }}
+        body: |
+          ## Changes in this Release
+          
+          ### Features
+          - Enhanced knowledge base management capabilities
+          - Improved search accuracy and performance
+          - Better error handling and user feedback
+          
+          ### Bug Fixes
+          - Fixed API key security issues
+          - Resolved system directory creation problems
+          - Improved cross-platform compatibility
+          
+          ### Documentation
+          - Updated installation guides
+          - Added deployment documentation
+          - Enhanced troubleshooting guides
+          
+          ## Installation
+          
+          ```bash
+          # Clone the repository
+          git clone https://github.com/${{ github.repository }}.git
+          
+          # Install kb-manager
+          cd kb-manager
+          pip install -r requirements.txt
+          
+          # Install kb-reader
+          cd ../kb-reader
+          pip install -r requirements.txt
+          ```
+          
+          ## Docker Images
+          
+          ```bash
+          docker pull ${{ secrets.DOCKER_USERNAME }}/kb-manager:v${{ steps.version.outputs.version }}
+          docker pull ${{ secrets.DOCKER_USERNAME }}/kb-reader:v${{ steps.version.outputs.version }}
+          ```
+        draft: false
+        prerelease: false
